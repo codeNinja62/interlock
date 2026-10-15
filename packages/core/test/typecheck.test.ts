@@ -554,12 +554,29 @@ describe('type-check service', () => {
     };
 
     /**
-     * The DOM's declarations take a check past the smallest heap a worker is
-     * given (measured at 167 MiB, against 66 MiB without them).
+     * A check twice past the smallest heap a worker is given, on every Node
+     * the suite runs on: the DOM's declarations and 300 modules of typed
+     * values, measured at 307 MiB on Node 24 and 268 MiB on Node 26. The
+     * DOM's alone, 169 MiB on Node 24, is 116 MiB on Node 26 — under it.
      */
     const large: Files = {
       'tsconfig.json': tsconfig({ lib: ['esnext', 'dom'] }),
-      'src/a.ts': 'export const a = 1;\n',
+      ...Object.fromEntries(
+        Array.from({ length: 300 }, (_, i) => [
+          `src/f${String(i)}.ts`,
+          Array.from({ length: 20 }, (_, j) => {
+            const props = Array.from({ length: 10 }, (_, k) => k);
+            return [
+              `export interface T${String(j)} {`,
+              ...props.map((k) => `  p${String(k)}: ${k % 2 === 0 ? 'string' : 'number'};`),
+              '}',
+              `export const v${String(j)}: T${String(j)} = { ${props
+                .map((k) => `p${String(k)}: ${k % 2 === 0 ? `'${String(k)}'` : String(k)}`)
+                .join(', ')} };`,
+            ].join('\n');
+          }).join('\n'),
+        ]),
+      ),
     };
 
     it('does not keep a service whose heap has grown past its bound', async () => {
