@@ -287,8 +287,8 @@ _which branch caused which half_ of each one.
       **Done when:** a repository whose `main` already has type errors produces zero findings for a merge that introduces none, and a genuinely merge-induced error is still reported.
       **Constraints:** without this every finding is polluted by pre-existing noise, and the false-positive budget is blown on day one. Four compiler runs per pair is also four times the cost, so cache aggressively — A and B alone change only when their own snapshots change.
 
-- [ ] **Attribution engine**
-      **Files:** `packages/core/src/analyzers/attribution.ts`, `attribution.test.ts`, `analyzers/index.ts`, `analyzers/notes.md`, `packages/core/src/merge/conflict-classifier.ts` (its blob reader, exported), `packages/shared/src/models/finding.ts` (the `confidence` comment), `packages/core/test/attribution.test.ts`, `packages/core/test/support/attribution-fixtures.ts`, `packages/core/test/user-repo-untouched.test.ts`, `docs/architecture.md`, `docs/threat-model.md` (only if a printed field's contents change)
+- [x] **Attribution engine**
+      **Files:** `packages/core/src/analyzers/attribution.ts`, `attribution.test.ts`, `analyzers/index.ts`, `analyzers/notes.md`, `packages/core/src/merge/conflict-classifier.ts` (its blob reader, exported), `packages/shared/src/models/finding.ts` (the `confidence` comment), `packages/core/test/attribution.test.ts`, `packages/core/test/support/attribution-fixtures.ts`, `packages/core/test/user-repo-untouched.test.ts`, `packages/core/README.md`, `docs/architecture.md`, `docs/threat-model.md` (only if a printed field's contents change)
       **What:** turn a diagnostic from the merged tree into a typecheck Finding about the two branches — which one changed the declaration the diagnostic names, which one holds the stale reference, a span on each in that branch's own lines, the rule the pair breaks, and the compiler's output as evidence. It takes any diagnostic as input and is independent of the baseline differ. Adding a typecheck analyzer to `ANALYZER_PIPELINE` is not this task.
 
   Rewritten before starting, from the issue. **The code gives the family; the
@@ -310,8 +310,10 @@ _which branch caused which half_ of each one.
   `ts.createSourceFile`, no program — and the diagnostic's offset must land on
   the line and column it reports, on an identifier for a name, or inside a call
   whose callee is a name or a property access for an arity. Anything else —
-  the file not in the tree, over the blob cap, binary, unparseable, or an
-  offset that does not hold a name — is attributed to no branch.
+  the file not in the tree, over the parse cap, binary, unparseable, or an
+  offset that does not hold a name — is attributed to no branch. Parsing is on
+  the daemon's thread, so a file over 256 KiB is not parsed and each parse is
+  a turn of its own; the longest stall is measured and recorded.
 
   **The declaration is found in the pair's merge base:** for an imported name,
   in the module a relative specifier resolves to (`.ts`, `.tsx`, `.d.ts`,
@@ -365,10 +367,10 @@ _which branch caused which half_ of each one.
   names. Anything else is `merge-breaks-typecheck` — named as the eval suite
   names `merge-breaks-test` — with `originBranch` null, confidence 0.5, and a
   rationale saying what could not be told. Reasons are checked in a fixed
-  order — code, location, ChangeSet, declaration, reference in the base,
-  declaring branch, referencing branch, mapping — and the first that applies is
-  the rationale. Severity is `high` either way: the merged tree does not
-  compile.
+  order — code, location, a missing ChangeSet, declaration, a stale ChangeSet,
+  reference in the base, declaring branch, mapping, referencing branch — and
+  the first that applies is the rationale. Severity is `high` either way: the
+  merged tree does not compile.
 
   **Evidence:** a span on each branch that has a half, declaring side first,
   each with a short redacted excerpt (`excerptOf`); a symbol trail — the
