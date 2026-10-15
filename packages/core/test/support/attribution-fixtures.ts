@@ -13,6 +13,7 @@ import type {
 } from '@interlock/shared';
 import { attributeDiagnostics } from '../../src/analyzers/attribution.js';
 import type { AttributedDiagnostics, AttributionRequest } from '../../src/analyzers/attribution.js';
+import { listTree } from '../../src/analyzers/typecheck.js';
 import type { FileDiagnostic, TypecheckRegistry } from '../../src/analyzers/typecheck.js';
 import { extractChangeSet } from '../../src/git/diff.js';
 import { createGitRunner } from '../../src/git/repo-handle.js';
@@ -230,14 +231,20 @@ async function buildPair(
       },
       async (slot) => {
         try {
-          return await registry.check({ root: slot.path, dependencyRoot: user, fill: slot.fill });
+          return await registry.check({
+            root: slot.path,
+            dependencyRoot: user,
+            tree: await listTree(runner, slot.repo, slot.treeOid),
+          });
         } finally {
           await registry.release(slot.path);
         }
       },
     );
     if (outcome.kind !== 'ran') throw new Error(`the slot was skipped: ${outcome.reason}`);
-    if (outcome.value.kind !== 'checked') throw new Error('the check was cancelled');
+    if (outcome.value.kind !== 'checked') {
+      throw new Error(`the check did not complete: ${outcome.value.kind}`);
+    }
     diagnostics = outcome.value.report.files;
   }
 
