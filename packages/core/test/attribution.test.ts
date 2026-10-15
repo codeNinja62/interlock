@@ -11,6 +11,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { SEMANTIC } from '../../../eval/fixtures/semantic.js';
 import { matches } from '../../../eval/fixtures/score.js';
 import {
+  ATTRIBUTED_CONFIDENCE,
   ATTRIBUTION_RULES,
   MAX_PARSED_BYTES,
   MAX_SCANNED_FILES,
@@ -98,6 +99,8 @@ function expectUnattributed(finding: Finding, reason: UnattributedReason): void 
   expect(finding.rule).toBe(ATTRIBUTION_RULES.generic);
   expect(finding.attribution.originBranch).toBeNull();
   expect(finding.confidence).toBe(UNATTRIBUTED_CONFIDENCE);
+  // Lower than an attributed Finding's, whatever the constants are set to.
+  expect(finding.confidence).toBeLessThan(ATTRIBUTED_CONFIDENCE);
   expect(finding.attribution.rationale).toBe(UNATTRIBUTED_RATIONALES[reason]);
   // Never nothing: the compiler's output is evidence however little else is known.
   expect(toolOutput(finding).exitCode).toBe(TSC_ERROR_EXIT);
@@ -492,6 +495,76 @@ describe('references', () => {
     ]);
   });
 
+  it('names a removal, not a rename, when two declarations took its place', async () => {
+    const pair = await checkedPair(
+      { ...PROJECT, 'src/payments.ts': PAYMENTS },
+      committed(
+        write(
+          'src/payments.ts',
+          lines(
+            'export function refundPayment(orderId: string): string {',
+            '  return `refund:${orderId}`;',
+            '}',
+            '',
+            'export function refundCard(cardId: string): string {',
+            '  return `card:${cardId}`;',
+            '}',
+          ),
+        ),
+      ),
+      committed(write('src/support.ts', SUPPORT)),
+    );
+    const finding = only((await pair.attribute()).findings);
+    expect(finding.rule).toBe(ATTRIBUTION_RULES.generic);
+    expect(finding.attribution.originBranch).toBe(pair.branchA);
+    expect(trail(finding).map((step) => step.action)).toEqual(['deleted', 'referenced']);
+  });
+
+  it('names no move when the export turns up in two new modules', async () => {
+    const moved = SEMANTIC_CASES.find((each) => each.id === 'moved-export-vs-import')!;
+    const slugify = moved.a.committed.find(
+      (operation) => operation.op === 'write' && operation.path === 'src/strings.ts',
+    )!;
+    const pair = await checkedPair(
+      moved.base,
+      committed(
+        ...moved.a.committed,
+        write('src/text.ts', slugify.op === 'write' ? slugify.content : ''),
+      ),
+      moved.b,
+    );
+    const finding = only((await pair.attribute()).findings);
+    expect(finding.rule).toBe(ATTRIBUTION_RULES.generic);
+    expect(finding.attribution.originBranch).toBe(pair.branchA);
+  });
+
+  it('spans a stale import from its first line when the name sits on a later one', async () => {
+    const pair = await checkedPair(
+      rename.base,
+      rename.a,
+      committed(
+        write(
+          'src/support.ts',
+          lines(
+            'import {',
+            '  processRefund,',
+            '} from "./payments";',
+            '',
+            'export function escalate(orderId: string): string {',
+            '  return processRefund(orderId);',
+            '}',
+          ),
+        ),
+      ),
+    );
+    expect(pair.diagnostics.map((each) => each.line)).toEqual([2]);
+    const finding = only((await pair.attribute()).findings);
+    expect(finding.rule).toBe(ATTRIBUTION_RULES.rename);
+    expect(spans(finding, pair.branchB)).toEqual([
+      { path: 'src/support.ts', startLine: 1, endLine: 6 },
+    ]);
+  });
+
   it('keeps a path holding a space as the path', async () => {
     const pair = await checkedPair(
       rename.base,
@@ -625,6 +698,8 @@ describe('when it cannot tell, it names no branch', () => {
       { ...diagnostic!, start: diagnostic!.start + 1, column: diagnostic!.column + 1 },
       { ...diagnostic!, start: 1_000_000 },
       { ...diagnostic!, file: 'node_modules/typescript/lib/lib.d.ts' },
+      // Where the name starts, and shorter than it: some other text than the name.
+      { ...diagnostic!, length: 5 },
     ]) {
       expectUnattributed(
         only((await pair.attribute({ diagnostics: [moved] })).findings),
@@ -724,6 +799,159 @@ describe('when it cannot tell, it names no branch', () => {
     expect(spans(finding, pair.branchB)).toEqual([
       { path: 'src/payments.ts', startLine: 4, endLine: 7 },
     ]);
+  });
+
+  it('when a ChangeSet says a file was added that its base already had', async () => {
+    const pair = await checkedPair(
+      { ...rename.base, 'src/support.ts': 'export const support = 1;\n' },
+      rename.a,
+      committed(write('src/support.ts', SUPPORT)),
+    );
+    expect(only((await pair.attribute()).findings).attribution.originBranch).toBe(pair.branchA);
+    const forged = {
+      ...pair.changeSetB,
+      files: pair.changeSetB.files.map((file) => ({ ...file, kind: 'added' as const })),
+    };
+    expectUnattributed(
+      only((await pair.attribute({ changeSetB: forged })).findings),
+      'stale-change-set',
+    );
+  });
+
+  it('when the member a property names is declared in more than one changed file', async () => {
+    const member = (container: string): string =>
+      lines(
+        `export class ${container} {`,
+        '  processRefund(orderId: string): string {',
+        '    return orderId;',
+        '  }',
+        '}',
+      );
+    const pair = await checkedPair(
+      { ...PROJECT, 'src/ledger.ts': member('Ledger'), 'src/wallet.ts': member('Wallet') },
+      committed(
+        write('src/ledger.ts', member('Ledger').replace('processRefund', 'refundPayment')),
+        write('src/wallet.ts', `// Wallets refund through the ledger.\n${member('Wallet')}`),
+      ),
+      committed(
+        write(
+          'src/support.ts',
+          lines(
+            'import { Ledger } from "./ledger";',
+            '',
+            'export const escalate = (ledger: Ledger, id: string): string =>',
+            '  ledger.processRefund(id);',
+          ),
+        ),
+      ),
+    );
+    expect(pair.diagnostics).toHaveLength(1);
+    // Which class `ledger` is needs a program; two candidates is a guess.
+    expectUnattributed(only((await pair.attribute()).findings), 'declaration-not-found');
+  });
+
+  it('when the member search would read more changed files than its bound', async () => {
+    const ledger = lines(
+      'export class Ledger {',
+      '  processRefund(orderId: string): string {',
+      '    return orderId;',
+      '  }',
+      '}',
+    );
+    const extras = Object.fromEntries(
+      Array.from({ length: MAX_SCANNED_FILES }, (_, index) => [
+        `src/extra-${String(index)}.ts`,
+        `export const extra${String(index)} = ${String(index)};\n`,
+      ]),
+    );
+    const pair = await checkedPair(
+      { ...PROJECT, ...extras, 'src/ledger.ts': ledger },
+      committed(
+        write('src/ledger.ts', ledger.replace('processRefund', 'refundPayment')),
+        ...Object.keys(extras).map((path) => write(path, `${extras[path]!}// touched\n`)),
+      ),
+      committed(
+        write(
+          'src/support.ts',
+          lines(
+            'import { Ledger } from "./ledger";',
+            '',
+            'export const escalate = (ledger: Ledger, id: string): string =>',
+            '  ledger.processRefund(id);',
+          ),
+        ),
+      ),
+    );
+    expectUnattributed(only((await pair.attribute()).findings), 'declaration-not-found');
+  });
+
+  it('when a call names something whose parameters only a program could read', async () => {
+    const typed = (parameters: string, body: string): string =>
+      lines(
+        `const make = () => (${parameters}) => ${body};`,
+        `export const formatPrice: (${parameters}) => string = make();`,
+      );
+    const pair = await checkedPair(
+      { ...PROJECT, 'src/format.ts': typed('amount: number', 'amount.toFixed(2)') },
+      committed(
+        write(
+          'src/format.ts',
+          typed('amount: number, currency: string', '`${currency} ${amount.toFixed(2)}`'),
+        ),
+      ),
+      committed(
+        write(
+          'src/invoice.ts',
+          lines('import { formatPrice } from "./format";', 'export const total = formatPrice(1);'),
+        ),
+      ),
+    );
+    expect(pair.diagnostics.map((each) => each.code)).toEqual([2554]);
+    expectUnattributed(only((await pair.attribute()).findings), 'declaration-not-found');
+  });
+
+  it('when the declaring branch only renamed the file, which leaves the name where it was', async () => {
+    const ledger = lines(
+      'export function processRefund(orderId: string): string {',
+      '  return `refund:${orderId}`;',
+      '}',
+      '',
+      'export function settleBatch(batchId: string): string {',
+      '  return `settle:${batchId}`;',
+      '}',
+    );
+    const escalate = lines(
+      '',
+      'export function escalate(orderId: string): string {',
+      '  return processRefund(orderId);',
+      '}',
+    );
+    const pair = await fixtures.pair(
+      { ...PROJECT, 'src/payments.ts': ledger },
+      {
+        committed: [{ op: 'rename', from: 'src/payments.ts', to: 'src/billing.ts' }],
+        uncommitted: [],
+      },
+      committed(write('src/payments.ts', ledger + escalate)),
+    );
+    // The merge compiles; a diagnostic at the call is made up to ask about
+    // the one branch that touched the declaration only by moving its file.
+    const merged = ledger + escalate;
+    const start = merged.indexOf('processRefund(orderId);');
+    const diagnostic: FileDiagnostic = {
+      code: 2304,
+      category: 'error',
+      message: "Cannot find name 'processRefund'.",
+      file: 'src/billing.ts',
+      start,
+      length: 'processRefund'.length,
+      line: 10,
+      column: 10,
+    };
+    expectUnattributed(
+      only((await pair.attribute({ diagnostics: [diagnostic] })).findings),
+      'change-does-not-explain',
+    );
   });
 });
 
