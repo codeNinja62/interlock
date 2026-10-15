@@ -294,9 +294,12 @@ export function hunkTouchesOld(hunk: Hunk, start: number, end: number): boolean 
   return hunk.oldStart <= end && start <= hunk.oldStart + hunk.oldLines - 1;
 }
 
-/** Whether a `--unified=0` hunk wrote 1-based line `line` of the new file. */
+/**
+ * Whether a `--unified=0` hunk wrote 1-based line `line` of the new file. A
+ * deletion writes nothing: with `newLines` 0 the range is empty.
+ */
 export function hunkAddsNew(hunk: Hunk, line: number): boolean {
-  return hunk.newLines > 0 && hunk.newStart <= line && line <= hunk.newStart + hunk.newLines - 1;
+  return hunk.newStart <= line && line <= hunk.newStart + hunk.newLines - 1;
 }
 
 // --- The decision -----------------------------------------------------------------
@@ -1008,7 +1011,7 @@ function walk(t: Compiler, file: ts.SourceFile): ts.Node[] {
 function isUse(t: Compiler, node: ts.Identifier): boolean {
   const parent = node.parent;
   if (t.isShorthandPropertyAssignment(parent)) return true;
-  if (t.isPropertyAccessExpression(parent)) return parent.expression === node;
+  // The right of `A.B` in a type is a member; it has no `name` to say so.
   if (t.isQualifiedName(parent)) return parent.left === node;
   if (t.isImportSpecifier(parent) || t.isExportSpecifier(parent) || t.isImportClause(parent)) {
     return false;
