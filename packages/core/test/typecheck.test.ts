@@ -992,7 +992,11 @@ describe('type-check service', () => {
         rmSync(elsewhere, { recursive: true, force: true });
       }
 
-      // Too many to read, or a checkout that is gone: versioned by the disk.
+      // Too many to read, or a checkout that is gone: versioned by the disk,
+      // whatever records the root holds.
+      mkdirSync(join(scratch, 'node_modules'));
+      writeFileSync(join(scratch, 'node_modules/.modules.yaml'), 'layoutVersion: 5\n');
+      expect(await installIdentity(scratch)).not.toBeNull();
       const fixtures = Array.from({ length: 40 }, (_, i) => `fixtures/f${String(i)}/yarn.lock`);
       expect(installRoots(listing(fixtures))).toBeNull();
       expect(await installIdentity(scratch, null)).toBeNull();
