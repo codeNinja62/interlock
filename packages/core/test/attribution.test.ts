@@ -7,9 +7,7 @@ import type {
   SpeculativeRunId,
   SymbolTrailStep,
 } from '@interlock/shared';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { SEMANTIC } from '../../../eval/fixtures/semantic.js';
-import { matches } from '../../../eval/fixtures/score.js';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ATTRIBUTED_CONFIDENCE,
   ATTRIBUTION_RULES,
@@ -137,31 +135,6 @@ async function checkedPair(
 }
 
 describe("the evaluation suite's typecheck cases", () => {
-  it('are mirrored here exactly as the read-only suite has them', () => {
-    for (const mirrored of SEMANTIC_CASES) {
-      const original = SEMANTIC.find((fixture) => fixture.id === mirrored.id);
-      expect(original, mirrored.id).toBeDefined();
-      expect(mirrored).toEqual({
-        id: original!.id,
-        base: original!.base,
-        a: original!.a,
-        b: original!.b,
-        expected: original!.expected,
-        twinOf: original!.twinOf,
-      });
-    }
-    const typecheckCases = SEMANTIC.filter(
-      (fixture) =>
-        fixture.expected.some((label) => label.analyzer === 'typecheck') ||
-        SEMANTIC.find((other) => other.id === fixture.twinOf)?.expected.some(
-          (label) => label.analyzer === 'typecheck',
-        ),
-    );
-    expect(SEMANTIC_CASES.map((each) => each.id).sort()).toEqual(
-      typecheckCases.map((fixture) => fixture.id).sort(),
-    );
-  });
-
   const actions: Readonly<Record<string, SymbolTrailStep['action']>> = {
     'rename-vs-callsite': 'renamed',
     'signature-vs-caller': 'signature-changed',
@@ -200,8 +173,6 @@ describe("the evaluation suite's typecheck cases", () => {
         { path: label.path, line: pair.diagnostics[0]!.line, column: pair.diagnostics[0]!.column },
       ]);
       expect(output.output).toContain(`TS${String(pair.diagnostics[0]!.code)}`);
-      // The suite's own matching rule, read from it rather than restated.
-      expect(matches(label, finding, { a: pair.branchA, b: pair.branchB })).toBe(true);
     });
   }
 
@@ -613,6 +584,26 @@ describe('when it cannot tell, it names no branch', () => {
     );
     expect(pair.diagnostics.map((each) => each.file)).toEqual(['src/checkout.ts']);
     expectUnattributed(only((await pair.attribute()).findings), 'reference-in-base');
+
+    // A ChangeSet claiming to have written that unchanged file is believed of nothing.
+    const claimed = {
+      path: 'src/checkout.ts',
+      previousPath: null,
+      kind: 'modified' as const,
+      hunks: [{ oldStart: 4, oldLines: 1, newStart: 4, newLines: 1 }],
+      symbols: [],
+      binary: false,
+    };
+    expectUnattributed(
+      only(
+        (
+          await pair.attribute({
+            changeSetB: { ...pair.changeSetB, files: [...pair.changeSetB.files, claimed] },
+          })
+        ).findings,
+      ),
+      'stale-change-set',
+    );
   });
 
   it("when the diagnostic's code is not one it reads", async () => {
@@ -1058,8 +1049,304 @@ describe('the batch', () => {
     expect(finding.attribution.originBranch).toBe(pair.branchA);
   });
 
-  it('answers the same for a pair with no work on one side', async () => {
+  it('is never asked about a pair where only one branch changed anything', async () => {
     const pair = await checkedPair(rename.base, rename.a, NO_CHANGE);
     expect(pair.diagnostics).toEqual([]);
+  });
+
+  it('loads the compiler again after a load that failed', async () => {
+    const pair = await fixtures.pair(rename.base, rename.a, rename.b);
+    const request = {
+      runId: ulid<SpeculativeRunId>(),
+      branchA: pair.branchA,
+      branchB: pair.branchB,
+      changeSetA: pair.changeSetA,
+      changeSetB: pair.changeSetB,
+      merge: pair.merge,
+      mergedTreeOid: pair.merged.treeOid,
+      diagnostics: [],
+      now: new Date().toISOString(),
+    };
+    vi.resetModules();
+    vi.doMock('typescript', () => {
+      throw new Error('no compiler');
+    });
+    try {
+      const fresh = await import('../src/analyzers/attribution.js');
+      await expect(
+        fresh.attributeDiagnostics(request, { runner: createGitRunner() }),
+      ).rejects.toThrow();
+      vi.doUnmock('typescript');
+      await expect(
+        fresh.attributeDiagnostics(request, { runner: createGitRunner() }),
+      ).resolves.toEqual({ findings: [], dropped: 0 });
+    } finally {
+      vi.doUnmock('typescript');
+      vi.resetModules();
+    }
+  });
+});
+
+describe('every claim a ChangeSet makes is checked against the trees', () => {
+  it('and one that does not hold names no branch', async () => {
+    const pair = await checkedPair(rename.base, rename.a, rename.b);
+    const fileOf = (path: string) =>
+      pair.changeSetA.files.find((file) => file.path === path || file.previousPath === path)!;
+    const payments = fileOf('src/payments.ts');
+    const forged: Partial<Parameters<Pair['attribute']>[0]>[] = [
+      // Deleted, though the merged commit still has it.
+      {
+        changeSetA: {
+          ...pair.changeSetA,
+          files: pair.changeSetA.files.map((file) =>
+            file === payments ? { ...file, kind: 'deleted' as const } : file,
+          ),
+        },
+      },
+      // Renamed to a path the merged commit does not have.
+      {
+        changeSetA: {
+          ...pair.changeSetA,
+          files: pair.changeSetA.files.map((file) =>
+            file === payments
+              ? { ...file, kind: 'renamed' as const, path: 'src/gone.ts', previousPath: file.path }
+              : file,
+          ),
+        },
+      },
+      // Modified, with a hunk, where the blob is the base's.
+      {
+        changeSetB: {
+          ...pair.changeSetB,
+          files: [
+            ...pair.changeSetB.files,
+            { ...payments, hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1 }] },
+          ],
+        },
+      },
+      // Modified, where its base never had the file.
+      {
+        changeSetB: {
+          ...pair.changeSetB,
+          files: pair.changeSetB.files.map((file) => ({ ...file, kind: 'modified' as const })),
+        },
+      },
+      // Renamed from a path its base never had.
+      {
+        changeSetB: {
+          ...pair.changeSetB,
+          files: pair.changeSetB.files.map((file) => ({
+            ...file,
+            kind: 'renamed' as const,
+            previousPath: 'src/nowhere.ts',
+          })),
+        },
+      },
+      // A base in which the declaration it compares hunks with is not there.
+      { changeSetA: { ...pair.changeSetA, mergeBaseSha: pair.merge.commitA } },
+    ];
+    for (const overrides of forged) {
+      expectUnattributed(only((await pair.attribute(overrides)).findings), 'stale-change-set');
+    }
+  });
+
+  it('a declaration whose file the declaring branch deleted is a removal, spanned where it was', async () => {
+    const pair = await fixtures.pair(
+      rename.base,
+      {
+        committed: [
+          { op: 'delete', path: 'src/payments.ts' },
+          { op: 'delete', path: 'src/checkout.ts' },
+        ],
+        uncommitted: [],
+      },
+      committed(write('src/support.ts', SUPPORT)),
+    );
+    // The compiler says the module is missing (2307); asked as a stale import
+    // instead, so the one path where the declaring side has no copy is taken.
+    const diagnostic: FileDiagnostic = {
+      code: 2305,
+      category: 'error',
+      message: "Module '\"./payments\"' has no exported member 'processRefund'.",
+      file: 'src/support.ts',
+      start: 9,
+      length: 13,
+      line: 1,
+      column: 10,
+    };
+    const finding = only((await pair.attribute({ diagnostics: [diagnostic] })).findings);
+    expect(finding.rule).toBe(ATTRIBUTION_RULES.generic);
+    expect(finding.attribution.originBranch).toBe(pair.branchA);
+    expect(spans(finding, pair.branchA)).toEqual([
+      { path: 'src/payments.ts', startLine: 1, endLine: 0 },
+    ]);
+  });
+});
+
+describe('more of what a branch can hold', () => {
+  /** Past the parse cap: a file attribution reads as unreadable. */
+  const huge = `// ${'x'.repeat(MAX_PARSED_BYTES)}\n`;
+  const ledger = lines(
+    'export class Ledger {',
+    '  processRefund(orderId: string): string {',
+    '    return orderId;',
+    '  }',
+    '',
+    '  charge(cents: number): string {',
+    '    return String(cents);',
+    '  }',
+    '}',
+  );
+
+  it('names the second branch when it is the one that changed the declaration', async () => {
+    const pair = await checkedPair(rename.base, rename.b, rename.a);
+    const finding = only((await pair.attribute()).findings);
+    expect(finding.rule).toBe(ATTRIBUTION_RULES.rename);
+    expect(finding.attribution.originBranch).toBe(pair.branchB);
+    expect(spans(finding, pair.branchB)).toEqual([
+      { path: 'src/payments.ts', startLine: 1, endLine: 1 },
+    ]);
+  });
+
+  it("attributes a method's changed signature from a call through its object", async () => {
+    const pair = await checkedPair(
+      { ...PROJECT, 'src/ledger.ts': ledger, 'src/huge.ts': huge },
+      committed(
+        write(
+          'src/ledger.ts',
+          ledger
+            .replace('charge(cents: number)', 'charge(cents: number, currency: string)')
+            .replace('String(cents)', '`${currency}${String(cents)}`'),
+        ),
+        // An unreadable file among those either branch changed is passed over.
+        write('src/huge.ts', `${huge}// touched\n`),
+      ),
+      committed(
+        write(
+          'src/support.ts',
+          lines(
+            'import { Ledger } from "./ledger";',
+            '',
+            'export const bill = (ledger: Ledger): string =>',
+            '  ledger.charge(5);',
+          ),
+        ),
+      ),
+    );
+    expect(pair.diagnostics.map((each) => each.code)).toEqual([2554]);
+    const finding = only((await pair.attribute()).findings);
+    expect(finding.rule).toBe(ATTRIBUTION_RULES.signature);
+    expect(finding.attribution.originBranch).toBe(pair.branchA);
+    expect(spans(finding, pair.branchA)).toEqual([
+      { path: 'src/ledger.ts', startLine: 6, endLine: 6 },
+    ]);
+    expect(spans(finding, pair.branchB)).toEqual([
+      { path: 'src/support.ts', startLine: 4, endLine: 4 },
+    ]);
+  });
+
+  it('finds the move past a changed file it cannot read', async () => {
+    const moved = SEMANTIC_CASES.find((each) => each.id === 'moved-export-vs-import')!;
+    const pair = await checkedPair(
+      moved.base,
+      committed(...moved.a.committed, write('src/huge.ts', huge)),
+      moved.b,
+    );
+    expect(only((await pair.attribute()).findings).rule).toBe(ATTRIBUTION_RULES.movedExport);
+  });
+
+  it('spans every use of a stale import, and nothing that only shares its name', async () => {
+    const pair = await checkedPair(
+      rename.base,
+      rename.a,
+      committed(
+        write(
+          'src/support.ts',
+          lines(
+            'import { processRefund } from "./payments";',
+            '',
+            'export function escalate(orderId: string): string {',
+            '  return processRefund(orderId);',
+            '}',
+            'export type Refund = typeof processRefund.name;',
+            'export const handlers = { processRefund };',
+            'export const flags = { processRefund: true };',
+            'export const enabled = flags.processRefund;',
+            'export type Flag = typeof flags.processRefund;',
+          ),
+        ),
+      ),
+    );
+    const finding = only((await pair.attribute()).findings);
+    // Through the shorthand on line 7; not the property and the member after it.
+    expect(spans(finding, pair.branchB)).toEqual([
+      { path: 'src/support.ts', startLine: 1, endLine: 7 },
+    ]);
+  });
+});
+
+describe('when a file it needs cannot be read, it names no branch', () => {
+  const filler = Array.from(
+    { length: 3000 },
+    (_, index) => `// ${String(index).padStart(96, '.')}`,
+  ).join('\n');
+  const settle = lines(
+    'export function settleBatch(batchId: string): string {',
+    '  return batchId;',
+    '}',
+  );
+
+  it("— the declaring module's, past the parse cap", async () => {
+    const pair = await checkedPair(
+      { ...PROJECT, 'src/payments.ts': `${PAYMENTS}${filler}\n` },
+      committed(
+        write(
+          'src/payments.ts',
+          `${PAYMENTS.replace('processRefund', 'refundPayment')}${filler}\n`,
+        ),
+      ),
+      committed(write('src/support.ts', SUPPORT)),
+    );
+    expectUnattributed(only((await pair.attribute()).findings), 'declaration-not-found');
+  });
+
+  it("— one branch's own copy of the file, though the merged one reads", async () => {
+    // `a` cuts the filler and renames; `b` calls the old name below it. Merged,
+    // the file is small; `b`'s own copy, filler and all, is past the cap.
+    const pair = await checkedPair(
+      { ...PROJECT, 'src/payments.ts': `${PAYMENTS}${filler}\n${settle}` },
+      committed(
+        write('src/payments.ts', `${PAYMENTS.replace('processRefund', 'refundPayment')}${settle}`),
+      ),
+      committed(
+        write(
+          'src/payments.ts',
+          `${PAYMENTS}${filler}\n${settle}${lines('', 'export const escalate = (id: string): string => processRefund(id);')}`,
+        ),
+      ),
+    );
+    expect(pair.diagnostics).toHaveLength(1);
+    // The merge base's copy is past the cap too, which is the first thing
+    // that cannot be told.
+    expectUnattributed(only((await pair.attribute()).findings), 'declaration-not-found');
+  });
+
+  it('— a name that resolves nowhere in a file the merge base never had', async () => {
+    const pair = await checkedPair(
+      rename.base,
+      rename.a,
+      committed(
+        write(
+          'src/support.ts',
+          lines(
+            'export function escalate(orderId: string): string {',
+            '  return processRefund(orderId);',
+            '}',
+          ),
+        ),
+      ),
+    );
+    expect(pair.diagnostics.map((each) => each.code)).toEqual([2304]);
+    expectUnattributed(only((await pair.attribute()).findings), 'declaration-not-found');
   });
 });

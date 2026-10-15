@@ -281,9 +281,9 @@ function apply(where: string, operations: readonly Operation[]): void {
 
 // --- The evaluation suite's semantic cases, mirrored ---------------------------------
 //
-// `eval/fixtures/semantic.ts` is read-only and outside the packages; these are
-// its typecheck cases and their twins, copied, and a test holds the copy equal
-// to it.
+// `eval/fixtures/semantic.ts` is read-only, and nothing under `packages/`
+// imports from `eval/` (its own suite asserts it), so these are its typecheck
+// cases and their twins, copied verbatim. A change there is copied here by hand.
 
 export const PROJECT: Files = {
   'package.json': '{\n  "name": "fixture",\n  "private": true,\n  "type": "module"\n}\n',

@@ -1,21 +1,26 @@
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
-import { SEMANTIC } from '../../../../eval/fixtures/semantic.js';
 import {
+  ATTRIBUTED_CONFIDENCE,
   ATTRIBUTION_RULES,
+  UNATTRIBUTED_CONFIDENCE,
   UNATTRIBUTED_RATIONALES,
   UNATTRIBUTED_REASONS,
   arityOf,
+  declarationsOf,
   decide,
+  exportsNamed,
   hunkAddsNew,
   hunkTouchesOld,
   mapLine,
   mapRange,
   moduleCandidates,
+  readReference,
   recognise,
   ruleFor,
+  scriptKindOf,
 } from './attribution.js';
-import type { SideFacts } from './attribution.js';
+import type { Declared, SideFacts } from './attribution.js';
 
 describe('recognise', () => {
   it.each([
@@ -39,20 +44,14 @@ describe('recognise', () => {
 
 describe('rules', () => {
   it('are the names the evaluation suite labels typecheck conflicts with', () => {
-    const labelled = new Set(
-      SEMANTIC.flatMap((fixture) =>
-        fixture.expected
-          .filter((label) => label.analyzer === 'typecheck')
-          .map((label) => label.class),
-      ),
-    );
-    expect(
-      new Set([
-        ATTRIBUTION_RULES.rename,
-        ATTRIBUTION_RULES.signature,
-        ATTRIBUTION_RULES.movedExport,
-      ]),
-    ).toEqual(labelled);
+    // Spelt out rather than read from `eval/`, which nothing in `packages/`
+    // imports; the integration suite's mirrored cases carry the same labels.
+    expect(ATTRIBUTION_RULES).toEqual({
+      rename: 'rename-vs-callsite',
+      signature: 'signature-vs-caller',
+      movedExport: 'moved-export-vs-import',
+      generic: 'merge-breaks-typecheck',
+    });
   });
 
   it('are never a compiler code', () => {
@@ -361,6 +360,255 @@ describe('decide', () => {
       kind: 'unattributed',
       reason: 'mapping-unsure',
     });
+  });
+});
+
+describe('confidence', () => {
+  it('is lower for a Finding that names no branch than for one that does', () => {
+    expect(UNATTRIBUTED_CONFIDENCE).toBeLessThan(ATTRIBUTED_CONFIDENCE);
+    expect(UNATTRIBUTED_CONFIDENCE).toBeGreaterThan(0);
+  });
+});
+
+const parse = (source: string, name = 'a.ts'): ts.SourceFile =>
+  ts.createSourceFile(name, source, ts.ScriptTarget.Latest, true);
+
+/** The declarations of a source, reduced to what each test asks about. */
+const declared = (source: string): Pick<Declared, 'name' | 'container' | 'exported'>[] =>
+  declarationsOf(ts, parse(source)).all.map(({ name, container, exported }) => ({
+    name,
+    container,
+    exported,
+  }));
+
+describe('declarationsOf', () => {
+  it('reads overloads as one declaration whose arity is their signatures, not the implementation', () => {
+    const [only, ...rest] = declarationsOf(
+      ts,
+      parse(
+        [
+          'export function f(a: string): string;',
+          'export function f(a: number, b: number): number;',
+          'export function f(a: unknown, b?: unknown): unknown {',
+          '  return a;',
+          '}',
+        ].join('\n'),
+      ),
+    ).all;
+    expect(rest).toEqual([]);
+    expect(only).toMatchObject({
+      name: 'f',
+      exported: true,
+      start: 1,
+      end: 5,
+      arity: '[[1,1],[2,2]]',
+    });
+  });
+
+  it("reads a class's and an interface's named members, and nothing unnamed", () => {
+    expect(
+      declared(
+        [
+          'export class C {',
+          '  m(a: number) {}',
+          '  p = 1;',
+          '  get g() { return 1; }',
+          '  set g(v: number) {}',
+          '  [Symbol.iterator]() {}',
+          "  'quoted'() {}",
+          '  constructor() {}',
+          '}',
+          'interface I { s(a: number): void; q: string }',
+          'export default class {}',
+        ].join('\n'),
+      ),
+    ).toEqual([
+      { name: 'C', container: null, exported: true },
+      { name: 'm', container: 'C', exported: true },
+      { name: 'p', container: 'C', exported: true },
+      { name: 'g', container: 'C', exported: true },
+      { name: 'g', container: 'C', exported: true },
+      { name: 'I', container: null, exported: false },
+      { name: 's', container: 'I', exported: false },
+      { name: 'q', container: 'I', exported: false },
+    ]);
+  });
+
+  it('reads types, enums and variables, each declarator for itself', () => {
+    const all = declarationsOf(
+      ts,
+      parse(
+        [
+          'export type T = string;',
+          'enum E { A }',
+          'export const a = 1,',
+          '  b = (x: number) => x;',
+          'const { c } = { c: 1 };',
+          'const f = x => x;',
+        ].join('\n'),
+      ),
+    ).all;
+    expect(all.map(({ name, exported }) => [name, exported])).toEqual([
+      ['T', true],
+      ['E', false],
+      ['a', true],
+      ['b', true],
+      ['f', false],
+    ]);
+    // Two declarators each own their own line; one owns the statement's.
+    expect(all.find((each) => each.name === 'b')).toMatchObject({ start: 4, arity: '[[1,1]]' });
+    // No parentheses to close: the parameters end on the name's line.
+    expect(all.find((each) => each.name === 'f')).toMatchObject({ paramsEnd: 6, arity: '[[1,1]]' });
+  });
+
+  it('reads a named import as a binding, and no other kind of import', () => {
+    expect(
+      declared(
+        [
+          "import x from './x';",
+          "import * as ns from './ns';",
+          "import './side';",
+          "import { a, b as c } from './m';",
+        ].join('\n'),
+      ),
+    ).toEqual([
+      { name: 'a', container: null, exported: false },
+      { name: 'c', container: null, exported: false },
+    ]);
+  });
+
+  it('reads local exports by name, and a re-export from another module as an export', () => {
+    const declarations = declarationsOf(
+      ts,
+      parse(
+        [
+          'const local = 1;',
+          'export { local as shown, local };',
+          "export { r as re } from './r';",
+          "export * from './all';",
+          "export { x as 'not-a-name' } from './s';",
+          'export const z = 2;',
+          'export { z };',
+        ].join('\n'),
+      ),
+    );
+    expect([...declarations.exportedAs]).toEqual([
+      ['shown', 'local'],
+      ['local', 'local'],
+      ['z', 'z'],
+    ]);
+    expect(declarations.all.map((each) => each.name)).toEqual(['local', 're', 'z']);
+    expect(exportsNamed(declarations, 'shown').map((each) => each.name)).toEqual(['local']);
+    expect(exportsNamed(declarations, 're').map((each) => each.name)).toEqual(['re']);
+    // Exported directly and by name: one declaration, not two.
+    expect(exportsNamed(declarations, 'z')).toHaveLength(1);
+    expect(exportsNamed(declarations, 'absent')).toEqual([]);
+  });
+});
+
+describe('scriptKindOf', () => {
+  it.each([
+    ['src/a.ts', ts.ScriptKind.TS],
+    ['src/a.mts', ts.ScriptKind.TS],
+    ['src/a.cts', ts.ScriptKind.TS],
+    ['src/a.d.ts', ts.ScriptKind.TS],
+    ['src/a.tsx', ts.ScriptKind.TSX],
+    ['src/a.js', ts.ScriptKind.JS],
+    ['src/a.mjs', ts.ScriptKind.JS],
+    ['src/a.cjs', ts.ScriptKind.JS],
+    ['src/a.jsx', ts.ScriptKind.JSX],
+  ])('reads %s as source', (path, kind) => {
+    expect(scriptKindOf(ts, path)).toBe(kind);
+  });
+
+  it.each(['package.json', 'Makefile', 'src/a.ts.orig', 'tsconfig.tsbuildinfo'])(
+    'does not read %s',
+    (path) => {
+      expect(scriptKindOf(ts, path)).toBeNull();
+    },
+  );
+});
+
+describe('readReference', () => {
+  /** Read the reference at the `occurrence`th `text` in `source`, as code `code` reports it. */
+  const at = (source: string, text: string, code: number, occurrence = 1): unknown => {
+    let start = -1;
+    for (let found = 0; found < occurrence; found++) start = source.indexOf(text, start + 1);
+    return readReference(ts, parse(source), { start, length: text.length }, recognise(code)!);
+  };
+
+  it('reads a stale import as the name it imports from its module, under its alias', () => {
+    const source = "import { a as b } from './m';";
+    expect(at(source, 'a', 2305)).toEqual({
+      family: 'name',
+      shape: 'import',
+      name: 'a',
+      specifier: './m',
+      binding: 'b',
+    });
+    // The alias is not what the module is asked for.
+    expect(at(source, 'b', 2305)).toBeNull();
+    expect(at('const a = 1;', 'a', 2305)).toBeNull();
+    expect(at('import { a } from x;', 'a', 2305)).toBeNull();
+  });
+
+  it('reads a property as a member, or as an export through a namespace import', () => {
+    expect(at('declare const o: object;\no.prop;', 'prop', 2339)).toEqual({
+      family: 'name',
+      shape: 'property',
+      name: 'prop',
+      specifier: null,
+      binding: null,
+    });
+    // The second `f`: the first is in `from`.
+    expect(at("import * as ns from './m';\nns.f;", 'f', 2339, 2)).toMatchObject({
+      shape: 'import',
+      specifier: './m',
+      binding: null,
+    });
+    expect(at('a.b.c;', 'c', 2339)).toMatchObject({ shape: 'property', name: 'c' });
+    // The object, not the property, is not what 2339 is about.
+    expect(at('o.prop;', 'o', 2339)).toBeNull();
+  });
+
+  it('reads an unresolved name as one at the top of its own file, but not a member', () => {
+    expect(at('foo();', 'foo', 2304)).toMatchObject({ shape: 'local', name: 'foo' });
+    expect(at('x.foo;', 'foo', 2304)).toBeNull();
+  });
+
+  it('refuses a span that is not exactly a name', () => {
+    expect(at("import { abc } from './m';", 'ab', 2305)).toBeNull();
+    expect(at("import { abc } from './m';", "'./m'", 2305)).toBeNull();
+  });
+
+  it('reads an arity from the callee, at its name or at an extra argument', () => {
+    expect(at('f(1);', 'f', 2554)).toMatchObject({ family: 'arity', shape: 'local', name: 'f' });
+    expect(at('f(1, 2);', '2', 2554)).toMatchObject({ shape: 'local', name: 'f' });
+    expect(at("import { g as h } from './m';\nh(1);", 'h', 2554, 2)).toMatchObject({
+      shape: 'import',
+      name: 'g',
+      specifier: './m',
+      binding: 'h',
+    });
+    expect(at('o.m(1, 2);', 'm', 2554)).toMatchObject({ shape: 'property', name: 'm' });
+    expect(
+      at("import * as other from './o';\nimport * as ns from './m';\nns.f(1);", 'f', 2554, 3),
+    ).toMatchObject({
+      shape: 'import',
+      specifier: './m',
+    });
+    expect(at("import * as ns from './m';\nns.f(1);", 'f', 2554, 2)).toMatchObject({
+      shape: 'import',
+      name: 'f',
+    });
+    // An argument that is itself a call belongs to the call around it.
+    expect(at('f(1, g(2));', 'g(2)', 2554)).toMatchObject({ name: 'f' });
+  });
+
+  it('reads no arity where the callee is not a name, or nothing is called', () => {
+    expect(at('class K { #p(a: number) {} q() { this.#p(); } }', '#p', 2554, 2)).toBeNull();
+    expect(at('((a: number) => a)();', '((a: number) => a)', 2554)).toBeNull();
+    expect(at('const x = 1;', 'x', 2554)).toBeNull();
   });
 });
 
