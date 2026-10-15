@@ -214,6 +214,19 @@ describe('typecheck service', () => {
       expect(confinement.fileExists(join(dirname(lib), 'missing.d.ts'))).toBe(false);
     });
 
+    it('finds nothing through a link out of the checkout into another node_modules', () => {
+      // A package manager's global store, or an `npm link`: a real
+      // `node_modules`, but not the checkout's.
+      write(outside, { 'node_modules/pkg/index.d.ts': 'outside' });
+      mkdirSync(join(deps, 'node_modules'), { recursive: true });
+      symlinkSync(join(outside, 'node_modules', 'pkg'), join(deps, 'node_modules', 'linked'));
+      const confinement = confine();
+      expect(confinement.fileExists(join(tree, 'node_modules/linked/index.d.ts'))).toBe(false);
+      expect(confinement.readFile(join(tree, 'node_modules/linked/index.d.ts'))).toBeUndefined();
+      expect(confinement.directoryExists(join(tree, 'node_modules/linked'))).toBe(false);
+      expect(confinement.fileExists(join(tree, 'node_modules/linked/added.d.ts'))).toBe(false);
+    });
+
     it('finds nothing in node_modules that is neither a file nor a directory', () => {
       mkdirSync(join(deps, 'node_modules', 'dep'), { recursive: true });
       // Opening a pipe for reading waits for a writer, so a read would hang the check.
