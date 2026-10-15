@@ -441,7 +441,7 @@ function functionOf(t: Compiler, node: ts.Node): ts.SignatureDeclaration | null 
 }
 
 /** A named declaration, as one tree has it. Lines and columns are 1-based. */
-interface Declared {
+export interface Declared {
   readonly name: string;
   readonly kind: ts.SyntaxKind;
   /** The class or interface holding a member; null at the top of the file. */
@@ -457,7 +457,8 @@ interface Declared {
   readonly arity: string | null;
 }
 
-interface Declarations {
+/** What one file declares, as {@link declarationsOf} reads it. */
+export interface Declarations {
   readonly all: readonly Declared[];
   /** `export { local as exported }` without a module: exported name to local name. */
   readonly exportedAs: ReadonlyMap<string, string>;
@@ -469,7 +470,7 @@ interface Declarations {
  * stops importing is a name it stops declaring — and a re-export from another
  * module counts as an export of the file. Nothing nested in a function is read.
  */
-function declarationsOf(t: Compiler, file: ts.SourceFile): Declarations {
+export function declarationsOf(t: Compiler, file: ts.SourceFile): Declarations {
   const all: Declared[] = [];
   const exportedAs = new Map<string, string>();
   const line = (position: number): number => file.getLineAndCharacterOfPosition(position).line + 1;
@@ -590,7 +591,7 @@ function closeParenLine(t: Compiler, file: ts.SourceFile, node: ts.Node): number
 }
 
 /** What a file exports under `name`: an exported declaration, a local export, or a re-export. */
-function exportsNamed(declarations: Declarations, name: string): Declared[] {
+export function exportsNamed(declarations: Declarations, name: string): Declared[] {
   const direct = declarations.all.filter(
     (declared) => declared.container === null && declared.exported && declared.name === name,
   );
@@ -627,7 +628,7 @@ interface Source {
 type Read = Source | 'absent' | 'unreadable';
 
 /** TypeScript's reading of a file by its extension; null for a file it would not read as source. */
-function scriptKindOf(t: Compiler, path: string): ts.ScriptKind | null {
+export function scriptKindOf(t: Compiler, path: string): ts.ScriptKind | null {
   const name = posix.basename(path);
   if (/\.[cm]?ts$/u.test(name)) return t.ScriptKind.TS;
   if (name.endsWith('.tsx')) return t.ScriptKind.TSX;
@@ -715,16 +716,21 @@ class Sources {
 
 // --- The reference ----------------------------------------------------------------
 
-interface Reference {
+/** What a diagnostic's location refers to, and where its declaration is looked for. */
+export type Reference = {
   readonly family: CodeFamily;
-  readonly shape: ReferenceShape;
   /** The name the declaration is looked for under. */
   readonly name: string;
-  /** For an import: the module specifier, as written. */
-  readonly specifier: string | null;
-  /** For a named import: the local name it binds, whose uses are stale with it. */
-  readonly binding: string | null;
-}
+} & (
+  | {
+      readonly shape: 'import';
+      /** The module specifier, as written. */
+      readonly specifier: string;
+      /** For a named import, the local name it binds, whose uses are stale with it. */
+      readonly binding: string | null;
+    }
+  | { readonly shape: 'property' | 'local'; readonly specifier: null; readonly binding: null }
+);
 
 /**
  * The innermost node whose source covers `[start, end)`. Iterative: a
@@ -777,10 +783,10 @@ function importBinding(
  * and never from the message, whose wording changes between TypeScript
  * releases. Null when the location does not hold what its code describes.
  */
-function readReference(
+export function readReference(
   t: Compiler,
   file: ts.SourceFile,
-  diagnostic: FileDiagnostic,
+  diagnostic: Pick<FileDiagnostic, 'start' | 'length'>,
   code: RecognisedCode,
 ): Reference | null {
   const start = diagnostic.start;
@@ -810,8 +816,7 @@ function readReference(
       case 'property':
         if (!t.isPropertyAccessExpression(parent) || parent.name !== node) return null;
         return memberReference(t, file, 'name', parent);
-      case 'local':
-      case null:
+      default:
         if (t.isPropertyAccessExpression(parent) && parent.name === node) return null;
         return { family: 'name', shape: 'local', name: node.text, specifier: null, binding: null };
     }
@@ -1013,9 +1018,7 @@ function isUse(t: Compiler, node: ts.Identifier): boolean {
   if (t.isShorthandPropertyAssignment(parent)) return true;
   // The right of `A.B` in a type is a member; it has no `name` to say so.
   if (t.isQualifiedName(parent)) return parent.left === node;
-  if (t.isImportSpecifier(parent) || t.isExportSpecifier(parent) || t.isImportClause(parent)) {
-    return false;
-  }
+  // `export { x }` names the binding it exports; `export { x as y }` reads it.
   return (parent as { name?: ts.Node }).name !== node;
 }
 
@@ -1292,7 +1295,7 @@ class Attributor {
     const candidates: Found[] = [];
     switch (reference.shape) {
       case 'import': {
-        const paths = moduleCandidates(mergedPath, reference.specifier ?? '');
+        const paths = moduleCandidates(mergedPath, reference.specifier);
         const entries = await this.#sources.entries(base, paths);
         const path = paths.find((candidate) => entries.get(candidate) != null);
         if (path === undefined) return null;
