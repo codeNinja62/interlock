@@ -5,6 +5,7 @@ import { InterlockError, pathIgnored, silentLogger } from '@interlock/shared';
 import type { Logger } from '@interlock/shared';
 import { createDebouncer } from './debounce.js';
 import type { Debouncer } from './debounce.js';
+import { watchDirectoryTree } from './tree-watch.js';
 
 /**
  * The filesystem half of the watcher: a source of debounced change signals and
@@ -128,7 +129,13 @@ export function createWorktreeWatcher(options: WorktreeWatcherOptions): Worktree
   const log = (options.logger ?? silentLogger).child('watcher');
   const watchFactory: WatchFactory =
     options.watchFactory ??
-    ((path, watchOptions) => watch(path, { recursive: watchOptions.recursive, persistent: true }));
+    ((path, watchOptions) =>
+      // Node's recursive mode on Linux throws past its own `error` event when
+      // a watched directory loses its permissions; elsewhere it is the
+      // platform's native recursive watch, which does not.
+      watchOptions.recursive && process.platform === 'linux'
+        ? watchDirectoryTree(path)
+        : watch(path, { recursive: watchOptions.recursive, persistent: true }));
   const targets = new Map<string, WatchedTarget>();
 
   const debouncer: Debouncer = createDebouncer({
