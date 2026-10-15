@@ -31,6 +31,8 @@ const errno = (code: string, path = '/elsewhere'): NodeJS.ErrnoException =>
 interface Fake {
   readonly system: TreeFileSystem;
   readonly watchers: Map<string, FakeWatcher>;
+  /** Every path a watch was asked for, in order. */
+  readonly watched: string[];
   /** Directories, by path, and the files in them. */
   readonly dirs: Map<string, Set<string>>;
   readonly fail: {
@@ -43,14 +45,17 @@ interface Fake {
 function fakeTree(...dirs: string[]): Fake {
   const tree = new Map<string, Set<string>>(dirs.map((dir) => [dir, new Set<string>()]));
   const watchers = new Map<string, FakeWatcher>();
+  const watched: string[] = [];
   const fail = { watch: new Map(), readdir: new Map(), lstat: new Map() };
   const parentOf = (path: string): string => path.slice(0, path.lastIndexOf('/')) || '/';
   return {
     watchers,
+    watched,
     dirs: tree,
     fail,
     system: {
       watch(path) {
+        watched.push(path);
         if (fail.watch.has(path)) throw fail.watch.get(path);
         const watcher = new FakeWatcher();
         watchers.set(path, watcher);
@@ -103,11 +108,20 @@ describe('watchDirectoryTree', () => {
   });
 
   it('names the root for a change to itself, and a directory inside by its own path', () => {
-    const fake = fakeTree('/r', '/r/src');
+    const fake = fakeTree('/r', '/r/src', '/r/src/deep');
     const { events } = started(fake);
     fake.watchers.get('/r')!.emit('change', 'change', 'r');
     fake.watchers.get('/r/src')!.emit('change', 'change', 'src');
-    expect(events).toEqual(['r', 'src']);
+    fake.watchers.get('/r/src/deep')!.emit('change', 'change', 'deep');
+    expect(events).toEqual(['r', 'src', 'src/deep']);
+  });
+
+  it('does not watch a directory again when an event names one it watches', () => {
+    const fake = fakeTree('/r', '/r/src');
+    const { events } = started(fake);
+    fake.watchers.get('/r')!.emit('change', 'change', 'src');
+    expect(events).toEqual(['src']);
+    expect(fake.watched).toEqual(['/r', '/r/src']);
   });
 
   it('throws for a root it cannot watch, or cannot list, and holds nothing open', () => {
@@ -196,6 +210,7 @@ describe('watchDirectoryTree', () => {
     const fake = fakeTree('/r');
     const { watcher, events } = started(fake);
     watcher.unref();
+    expect(fake.watchers.get('/r')?.referenced).toBe(false);
     fake.dirs.set('/r/fresh', new Set());
     fake.watchers.get('/r')!.emit('change', 'rename', 'fresh');
     expect(events).toEqual(['fresh']);
@@ -221,6 +236,8 @@ describe('watchDirectoryTree', () => {
     await tick();
     fake.watchers.get('/r')!.emit('change', 'change', 'late.txt');
     fake.watchers.get('/r')!.emit('error', errno('EPERM'));
+    // A directory vanishing would otherwise be announced as a change at once.
+    fake.watchers.get('/r/src')!.emit('error', errno('ENOENT'));
     await tick();
     expect(events).toEqual([]);
     expect(errors).toEqual([]);

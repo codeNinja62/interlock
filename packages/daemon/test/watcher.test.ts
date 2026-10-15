@@ -16,7 +16,7 @@ import { basename, join, sep } from 'node:path';
 import { createLogger } from '@interlock/shared';
 import type { LogRecord } from '@interlock/shared';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { createWorktreeWatcher } from '../src/watcher/worktree-watcher.js';
+import { createWorktreeWatcher, defaultWatchFactory } from '../src/watcher/worktree-watcher.js';
 import type {
   ChangeSignal,
   WatchFactory,
@@ -811,6 +811,22 @@ describe('worktree watcher', () => {
           // answer as a root the OS refuses from the start.
           expect(watcher.isDegraded(root)).toBe(true);
         });
+      });
+
+      it('keeps a flat watch flat: a git directory’s top level is one watch, not a tree', async () => {
+        const names: (string | null)[] = [];
+        const flat = defaultWatchFactory(join(root, 'src'), { recursive: false });
+        flat.on('change', (_event, name) => names.push(typeof name === 'string' ? name : null));
+        try {
+          mkdirSync(join(root, 'src', 'nested'));
+          await settle();
+          names.length = 0;
+          writeFileSync(join(root, 'src', 'nested', 'deep.txt'), 'x\n');
+          await settle();
+          expect(names).toEqual([]);
+        } finally {
+          flat.close();
+        }
       });
 
       it('keeps watching the rest of the worktree when a directory inside does', async () => {

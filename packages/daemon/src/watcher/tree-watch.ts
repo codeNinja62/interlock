@@ -167,9 +167,9 @@ class TreeWatcher extends EventEmitter {
     }
     if (stats === undefined) {
       this.#forget(path);
-    } else if (stats.isDirectory() && !this.#watchers.has(path)) {
+    } else if (stats.isDirectory()) {
       // A directory made, or put back, after the walk: a new inode a watch on
-      // the old one would never hear from.
+      // the old one would never hear from. One already watched is passed over.
       this.#watchDirectory(path, false);
     }
     this.emit('change', event, relative(this.#root, path));
