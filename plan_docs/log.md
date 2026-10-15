@@ -4,6 +4,11 @@ Short entries: done, decided, blocked. Newest first.
 
 ---
 
+## 2026-10-15 — attribution engine
+
+- **Task rewritten before starting.** "Attribution engine" was a paragraph; it now carries the code families, how the name and the declaration are found, the declaring and referencing decisions, the ChangeSet checks, the line mapping, the ambiguity order and the evidence, each with a `Done when`, from the issue. "Expand this milestone" stays unticked.
+- **Found — the rename and the moved export are the same diagnostic.** On TypeScript 6.0.3 both fixtures report TS2305 at the import specifier (`support.ts:1:10`, `tag.ts:1:10`); the signature fixture reports TS2554 at the callee (`invoice.ts:4:19`); every twin reports nothing, and `tsc --noEmit` exits 2. A table from code to rule, as the issue sketched it, would call the rename a move: the code gives the family, the declaring branch's change gives the rule.
+
 ## 2026-10-14 — typecheck runner
 
 - **Review — four fixes.** A cold fill now waits on the service until a check reaches the worker, so a cancelled cold check is not lost; checks queued on a stopped service fail with why it stopped, not "released"; `DEFAULT_PROJECT` and `siblingModule` moved to `typecheck-paths.ts`, so importing `@interlock/core` no longer loads `typescript`; a Finding of a kind no analyzer ran fails the run before anything is written. The daemon does not construct the registry yet: wiring it, `onEvict` and `close()` lands with the typecheck analyzer.
