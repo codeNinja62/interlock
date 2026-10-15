@@ -4,6 +4,13 @@ Short entries: done, decided, blocked. Newest first.
 
 ---
 
+## 2026-10-15 — watcher: a directory losing its permissions
+
+- **Found — the daemon exits when a watched directory loses its permissions, on Linux.** Node's recursive `fs.watch` there is JavaScript over one inotify watch per directory, and its `#onFolderEvent` calls `lstatSync` on the entry an event names with only `throwIfNoEntry: false`: a directory that can no longer be searched throws `EACCES` out of the inotify callback, past the watcher's `error` event, as an uncaught exception. A `chmod 000` reproduces it every time on Node 24.22 and 26.12, for the root and any directory under it. It surfaced as an unhandled error in `cli/test/status.test.ts` in full runs, on clean `dev` too.
+- **Decided — on Linux the worktree watcher builds its recursive watch itself** (`watcher/tree-watch.ts`): one non-recursive `fs.watch` per directory, every filesystem call caught, and a failure delivered as an `error` naming the directory, a tick late, where the existing rules place it — a directory inside is announced unnamed and the rest stays watched, an unreadable root falls back to polling, a vanished root is `ENOENT`. macOS and Windows keep Node's native recursive watch, which has no such path. Not an `uncaughtException` handler, which would swallow whatever else escapes.
+- **Mutation: 25 mutations, 20 caught; then 5 of 5 after tests.** Four survivors were missing tests, all added: a directory's own change two levels down, a vanished directory after `close`, `unref` reaching open watches, and a flat watch kept flat, asserted through the now-exported `defaultWatchFactory`. One was a guard against watching a directory twice, held both by the event handler and the walk; the handler's went.
+- **Checked — `pnpm verify` and `pnpm test:untouched`** in WSL Ubuntu with Docker 29.1: everything passes, every coverage floor holds, and the full run has no unhandled error; the status test that surfaced it ran clean 10 times of 10. `tree-watch.ts`: 99 % statements, 98 % branches, 100 % functions and lines.
+
 ## 2026-10-15 — attribution engine
 
 - **Checked again with Docker 29.1** (same machine): build, lint, format and typecheck pass; all 2,025 tests pass, the sandbox suite's included, and every coverage floor holds, `core` included. `test:untouched` passes. The coverage run still exits 1, on one unhandled error.
