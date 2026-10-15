@@ -25,11 +25,12 @@ import type {
   WorkerResponse,
 } from './typecheck-service.js';
 
+// The listing's entry type stays the analyzer's own: core has other tree
+// listings, and one name on its surface cannot serve them all.
 export type {
   ConfigDiagnostic,
   DiagnosticCategory,
   FileDiagnostic,
-  TreeEntry,
   TreeListing,
   TypecheckReport,
 } from './typecheck-service.js';
